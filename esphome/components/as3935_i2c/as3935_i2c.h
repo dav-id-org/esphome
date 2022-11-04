@@ -9,6 +9,8 @@
 namespace esphome {
 namespace as3935_i2c {
 
+constexpr bool I2C_WRITE_WITHOUT_STOP = false;
+
 class I2CAS3935Component : public as3935::AS3935Component, public i2c::I2CDevice {
  public:
   void dump_config() override;

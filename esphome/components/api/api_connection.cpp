@@ -110,20 +110,29 @@ void APIConnection::loop() {
 #ifdef USE_ESP32_CAMERA
   if (this->image_reader_.available() && this->helper_->can_write_without_blocking()) {
     uint32_t to_send = std::min((size_t) 1024, this->image_reader_.available());
-    auto buffer = this->create_buffer();
-    // fixed32 key = 1;
-    buffer.encode_fixed32(1, esp32_camera::global_esp32_camera->get_object_id_hash());
-    // bytes data = 2;
-    buffer.encode_bytes(2, this->image_reader_.peek_data_buffer(), to_send);
-    // bool done = 3;
-    bool done = this->image_reader_.available() == to_send;
-    buffer.encode_bool(3, done);
-    bool success = this->send_buffer(buffer, 44);
+    auto image_data = this->image_reader_.peek_data_buffer(to_send);
 
-    if (success) {
-      this->image_reader_.consume_data(to_send);
+    if (nullptr != image_data) {
+      auto buffer = this->create_buffer();
+      auto done = (bool)(this->image_reader_.available() == to_send);
+
+      // fixed32 key = 1;
+      buffer.encode_fixed32(1, esp32_camera::global_esp32_camera->get_object_id_hash());
+      // bytes data = 2;
+      buffer.encode_bytes(2, image_data, to_send);
+      // bool done = 3;
+      buffer.encode_bool(3, done);
+
+      if (true == this->send_buffer(buffer, 44)) {
+        this->image_reader_.consume_data(to_send);
+
+        if (true == done) {
+            this->image_reader_.return_image();
+        }
+      }
     }
-    if (success && done) {
+    else {
+      // error --> release image pointer
       this->image_reader_.return_image();
     }
   }

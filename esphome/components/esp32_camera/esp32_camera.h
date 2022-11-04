@@ -7,8 +7,6 @@
 #include "esphome/core/entity_base.h"
 #include "esphome/core/helpers.h"
 #include <esp_camera.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
 
 namespace esphome {
 namespace esp32_camera {
@@ -74,8 +72,8 @@ class CameraImage {
   bool was_requested_by(CameraRequester requester) const;
 
  protected:
-  camera_fb_t *buffer_;
-  uint8_t requesters_;
+  camera_fb_t *buffer_{nullptr};
+  uint8_t requesters_{0};
 };
 
 /* ---------------- CameraImageReader class ---------------- */
@@ -83,12 +81,12 @@ class CameraImageReader {
  public:
   void set_image(std::shared_ptr<CameraImage> image);
   size_t available() const;
-  uint8_t *peek_data_buffer();
+  uint8_t *peek_data_buffer(size_t len);
   void consume_data(size_t consumed);
   void return_image();
 
  protected:
-  std::shared_ptr<CameraImage> image_;
+  std::shared_ptr<CameraImage> image_{nullptr};
   size_t offset_{0};
 };
 
@@ -151,10 +149,7 @@ class ESP32Camera : public Component, public EntityBase {
 
  protected:
   /* internal methods */
-  bool has_requested_image_() const;
-  bool can_return_image_() const;
-
-  static void framebuffer_task(void *pv);
+  bool is_new_image_requested_();
 
   /* attributes */
   /* camera configuration */
@@ -187,13 +182,10 @@ class ESP32Camera : public Component, public EntityBase {
   std::shared_ptr<CameraImage> current_image_;
   uint8_t single_requesters_{0};
   uint8_t stream_requesters_{0};
-  QueueHandle_t framebuffer_get_queue_;
-  QueueHandle_t framebuffer_return_queue_;
   CallbackManager<void(std::shared_ptr<CameraImage>)> new_image_callback_;
   CallbackManager<void()> stream_start_callback_{};
   CallbackManager<void()> stream_stop_callback_{};
 
-  uint32_t last_idle_request_{0};
   uint32_t last_update_{0};
 };
 

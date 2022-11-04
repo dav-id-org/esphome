@@ -4,8 +4,6 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 
-#include <freertos/task.h>
-
 namespace esphome {
 namespace esp32_camera {
 
@@ -29,18 +27,6 @@ void ESP32Camera::setup() {
 
   /* initialize camera parameters */
   this->update_camera_parameters();
-
-  /* initialize RTOS */
-  this->framebuffer_get_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-  this->framebuffer_return_queue_ = xQueueCreate(1, sizeof(camera_fb_t *));
-  xTaskCreatePinnedToCore(&ESP32Camera::framebuffer_task,
-                          "framebuffer_task",  // name
-                          1024,                // stack size
-                          nullptr,             // task pv params
-                          0,                   // priority
-                          nullptr,             // handle
-                          1                    // core
-  );
 }
 
 void ESP32Camera::dump_config() {
@@ -125,50 +111,43 @@ void ESP32Camera::dump_config() {
 }
 
 void ESP32Camera::loop() {
-  // check if we can return the image
-  if (this->can_return_image_()) {
-    // return image
-    auto *fb = this->current_image_->get_raw_buffer();
-    xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
-    this->current_image_.reset();
+  enum { FSM_IDLE = 0U, FSM_RELEASE_PICTURE = 1U, /*FSM_PICTURE_STILL_IN_USE managed by default */ };
+  auto shared_ptr_count = this->current_image_.use_count();
+  // Set behavior in function of shared_ptr use count :
+  switch (shared_ptr_count) {
+      // 0 : New image can be retrieved
+      case FSM_IDLE: {
+        // request new image
+        if (true == this->is_new_image_requested_()) {
+          camera_fb_t* fb = esp_camera_fb_get();
+        
+          if (fb != nullptr) {
+            ESP_LOGD(TAG, "Got Image: len=%u", fb->len);
+            this->current_image_ = std::make_shared<CameraImage>(fb, this->single_requesters_ | this->stream_requesters_);
+            this->new_image_callback_.call(this->current_image_);
+            this->last_update_ = millis();
+            this->single_requesters_ = 0U;
+          }
+          else {
+            ESP_LOGW(TAG, "Got invalid frame from camera!");
+          }
+        }
+      } break;
+      // 1: We can return the FB to camera
+      case FSM_RELEASE_PICTURE: {
+        ESP_LOGV(TAG, "Release Image");
+        // return framebuffer
+        auto *fb = this->current_image_->get_raw_buffer();
+        esp_camera_fb_return(fb);
+        // Reset shared_ptr
+        this->current_image_.reset();
+      } break;
+      // 2+: Image is still in use
+      default: {
+        ESP_LOGVV(TAG, "Image still in use");
+        // Do nothing
+      } break;
   }
-
-  // request idle image every idle_update_interval
-  const uint32_t now = millis();
-  if (this->idle_update_interval_ != 0 && now - this->last_idle_request_ > this->idle_update_interval_) {
-    this->last_idle_request_ = now;
-    this->request_image(IDLE);
-  }
-
-  // Check if we should fetch a new image
-  if (!this->has_requested_image_())
-    return;
-  if (this->current_image_.use_count() > 1) {
-    // image is still in use
-    return;
-  }
-  if (now - this->last_update_ <= this->max_update_interval_)
-    return;
-
-  // request new image
-  camera_fb_t *fb;
-  if (xQueueReceive(this->framebuffer_get_queue_, &fb, 0L) != pdTRUE) {
-    // no frame ready
-    ESP_LOGVV(TAG, "No frame ready");
-    return;
-  }
-
-  if (fb == nullptr) {
-    ESP_LOGW(TAG, "Got invalid frame from camera!");
-    xQueueSend(this->framebuffer_return_queue_, &fb, portMAX_DELAY);
-    return;
-  }
-  this->current_image_ = std::make_shared<CameraImage>(fb, this->single_requesters_ | this->stream_requesters_);
-
-  ESP_LOGD(TAG, "Got Image: len=%u", fb->len);
-  this->new_image_callback_.call(this->current_image_);
-  this->last_update_ = now;
-  this->single_requesters_ = 0;
 }
 
 float ESP32Camera::get_setup_priority() const { return setup_priority::DATA; }
@@ -182,11 +161,13 @@ ESP32Camera::ESP32Camera(const std::string &name) : EntityBase(name) {
   this->config_.ledc_channel = LEDC_CHANNEL_0;
   this->config_.pixel_format = PIXFORMAT_JPEG;
   this->config_.frame_size = FRAMESIZE_VGA;  // 640x480
-  this->config_.jpeg_quality = 10;
-  this->config_.fb_count = 1;
+  this->config_.jpeg_quality = 12;
+  this->config_.fb_count = 2;
+  //this->config_.grab_mode = CAMERA_GRAB_WHEN_EMPTY  //CAMERA_GRAB_LATEST. Sets when buffers should be filled
 
   global_esp32_camera = this;
 }
+
 ESP32Camera::ESP32Camera() : ESP32Camera("") {}
 
 /* ---------------- setters ---------------- */
@@ -201,6 +182,7 @@ void ESP32Camera::set_data_pins(std::array<uint8_t, 8> pins) {
   this->config_.pin_d6 = pins[6];
   this->config_.pin_d7 = pins[7];
 }
+
 void ESP32Camera::set_vsync_pin(uint8_t pin) { this->config_.pin_vsync = pin; }
 void ESP32Camera::set_href_pin(uint8_t pin) { this->config_.pin_href = pin; }
 void ESP32Camera::set_pixel_clock_pin(uint8_t pin) { this->config_.pin_pclk = pin; }
@@ -322,16 +304,36 @@ void ESP32Camera::update_camera_parameters() {
 }
 
 /* ---------------- Internal methods ---------------- */
-bool ESP32Camera::has_requested_image_() const { return this->single_requesters_ || this->stream_requesters_; }
-bool ESP32Camera::can_return_image_() const { return this->current_image_.use_count() == 1; }
-void ESP32Camera::framebuffer_task(void *pv) {
-  while (true) {
-    camera_fb_t *framebuffer = esp_camera_fb_get();
-    xQueueSend(global_esp32_camera->framebuffer_get_queue_, &framebuffer, portMAX_DELAY);
-    // return is no-op for config with 1 fb
-    xQueueReceive(global_esp32_camera->framebuffer_return_queue_, &framebuffer, portMAX_DELAY);
-    esp_camera_fb_return(framebuffer);
+bool ESP32Camera::is_new_image_requested_() {
+  bool state_return = false;
+  uint32_t update_time_delta = millis() - this->last_update_;
+  uint8_t idle_requester_mask = 1U << CameraRequester::IDLE;
+  
+  // Test single image request condition (except IDLE)
+  if (0U != (this->single_requesters_ & ~idle_requester_mask)) {
+    // Single request
+    ESP_LOGV(TAG, "Image request (Single)");
+    state_return = true;
   }
+  // Test stream request condition (except IDLE)
+  else if ((0U != (this->stream_requesters_ & ~idle_requester_mask)) && (update_time_delta > this->max_update_interval_)) {
+    // Stream request
+      ESP_LOGV(TAG, "Image request (Normal fps)");
+      state_return = true;
+  }
+  // Test IDLE state condition
+  else if (update_time_delta > this->idle_update_interval_) {
+    // IDLE request
+    ESP_LOGV(TAG, "Image request (IDLE fps)");
+    this->single_requesters_ |= idle_requester_mask;
+    state_return = true;
+  }
+  else {
+    // Frame not requested --> Do nothing
+    state_return = false;
+  }
+
+  return state_return;
 }
 
 ESP32Camera *global_esp32_camera;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -341,15 +343,48 @@ void CameraImageReader::set_image(std::shared_ptr<CameraImage> image) {
   this->image_ = std::move(image);
   this->offset_ = 0;
 }
-size_t CameraImageReader::available() const {
-  if (!this->image_)
-    return 0;
 
-  return this->image_->get_data_length() - this->offset_;
+size_t CameraImageReader::available() const {
+  size_t value_returned = 0U;
+  
+  if (nullptr != this->image_) {
+    if (this->offset_ < this->image_->get_data_length()) {
+      value_returned = this->image_->get_data_length() - this->offset_;
+    }
+  }
+  
+  return value_returned;
 }
-void CameraImageReader::return_image() { this->image_.reset(); }
-void CameraImageReader::consume_data(size_t consumed) { this->offset_ += consumed; }
-uint8_t *CameraImageReader::peek_data_buffer() { return this->image_->get_data_buffer() + this->offset_; }
+
+void CameraImageReader::return_image() {
+  if (this->offset_ != this->image_->get_data_length()) {
+    ESP_LOGW(TAG, "Image not completely consumed");
+  }
+  this->image_.reset();
+}
+
+void CameraImageReader::consume_data(size_t consumed) {
+  if (this->offset_ + consumed <= this->image_->get_data_length()) {
+    this->offset_ += consumed;
+  }
+  else {
+    ESP_LOGW(TAG, "Offset saturated to max len (too many consumed data)");
+    this->offset_ = this->image_->get_data_length();
+  }
+}
+
+uint8_t *CameraImageReader::peek_data_buffer(size_t len) {
+  uint8_t* pointer_returned = nullptr;
+  
+  if ((this->offset_ + len) <= this->image_->get_data_length()) {
+    pointer_returned = this->image_->get_data_buffer() + this->offset_;
+  }
+  else {
+    ESP_LOGW(TAG, "Offset inconsistent during transmit of image");
+  }
+
+  return pointer_returned;
+}
 
 /* ---------------- CameraImage class ---------------- */
 CameraImage::CameraImage(camera_fb_t *buffer, uint8_t requesters) : buffer_(buffer), requesters_(requesters) {}
